@@ -3,8 +3,9 @@ from flask import Flask, render_template, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 import uuid
 import platform
-from services.whisper_service import WhisperService
-from services.mlx_whisper_service import MLXWhisperService, get_progress_info
+from services.whisper_service import WhisperService, get_whisperx_progress_info, reset_whisperx_progress
+from services.mlx_whisper_service import MLXWhisperService, get_progress_info, reset_progress
+from services.whisperkit_mlx_service import WhisperKitMLXService, get_whisperkit_progress_info, reset_whisperkit_progress
 
 # Load environment variables
 load_dotenv()
@@ -14,11 +15,18 @@ app = Flask(__name__, static_folder="../public", template_folder="../src/compone
 # Detect if running on Apple Silicon
 is_apple_silicon = (platform.processor() == 'arm' and platform.system() == 'Darwin')
 
+# Initialize metrics for all backends at startup
+reset_whisperx_progress()
+reset_progress()
+reset_whisperkit_progress()
+
+print("Initialized metrics for all backends")
+
 # Initialize WhisperService
 # The compute_type will be determined by the service based on the device
 whisper_service = WhisperService(
     hf_token=os.getenv("HF_TOKEN"),
-    model_name="large-v2",
+    model_name="large-v3",
     # Let the service determine the appropriate compute_type
     # Based on device (CPU, CUDA, MPS)
 )
@@ -54,13 +62,24 @@ def upload_file():
             language = request.form.get('language', None)
             max_speakers = int(request.form.get('max_speakers', 2))
             compute_type = request.form.get('compute_type', whisper_service.compute_type)
-            backend = request.form.get('backend', 'whisperx')
-            model_name = request.form.get('model_name', 'large-v2')
+            backend = request.form.get('backend', 'whisperkit')  # Default to WhisperKit on Apple Silicon
+            model_name = request.form.get('model_name', 'large-v3')
             batch_size = int(request.form.get('batch_size', 12)) if request.form.get('batch_size') else 12
+            output_name = request.form.get('output_name', 'transcript').strip()
             
             # Initialize service based on selected backend
-            if backend == 'mlx' and is_apple_silicon:
-                # Use MLX Whisper for Apple Silicon
+            if backend == 'whisperkit' and is_apple_silicon:
+                # Use WhisperKit by Argmax for Apple Silicon
+                # Configure with French as default language for better consistency
+                temp_service = WhisperKitMLXService(
+                    hf_token=os.getenv("HF_TOKEN"),
+                    model_name=model_name,
+                    compute_type=compute_type,
+                    batch_size=batch_size,
+                    default_language='fr'  # Force French by default for better consistency
+                )
+            elif backend == 'mlx' and is_apple_silicon:
+                # Use Lightning Whisper MLX for Apple Silicon
                 temp_service = MLXWhisperService(
                     hf_token=os.getenv("HF_TOKEN"),
                     model_name=model_name,
@@ -68,7 +87,7 @@ def upload_file():
                     batch_size=batch_size
                 )
             else:
-                # Use WhisperX as default or fallback
+                # Use WhisperX as fallback
                 temp_service = WhisperService(
                     hf_token=os.getenv("HF_TOKEN"),
                     model_name=model_name,
@@ -78,7 +97,7 @@ def upload_file():
             result = temp_service.transcribe(
                 audio_file=filepath,
                 language=language,
-                max_speakers=max_speakers if backend != 'mlx' else None
+                max_speakers=max_speakers if backend not in ['mlx', 'whisperkit'] else None
             )
             
             # Return result
@@ -87,7 +106,8 @@ def upload_file():
                 "filename": filename,
                 "result": result,
                 "backend": backend,
-                "device_info": temp_service.device_info
+                "device_info": temp_service.device_info,
+                "output_name": output_name
             })
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -118,8 +138,36 @@ def download_transcription(filename):
 @app.route('/progress', methods=['GET'])
 def get_progress():
     """Return current transcription progress"""
-    progress_data = get_progress_info()
+    # Try to get progress from different backends
+    backend = request.args.get('backend', 'whisperx')
+    
+    # Force update of system metrics before returning
+    try:
+        import psutil
+        
+        if backend == 'whisperkit':
+            from services.whisperkit_mlx_service import update_system_metrics as update_whisperkit_metrics
+            update_whisperkit_metrics()
+            progress_data = get_whisperkit_progress_info()
+        elif backend == 'mlx':
+            from services.mlx_whisper_service import update_system_metrics as update_mlx_metrics
+            update_mlx_metrics()
+            progress_data = get_progress_info()
+        else:  # whisperx or fallback
+            from services.whisper_service import update_whisperx_system_metrics
+            update_whisperx_system_metrics()
+            progress_data = get_whisperx_progress_info()
+    except Exception as e:
+        print(f"Error updating metrics: {e}")
+        # Fallback to basic progress data
+        if backend == 'whisperkit':
+            progress_data = get_whisperkit_progress_info()
+        elif backend == 'mlx':
+            progress_data = get_progress_info()
+        else:
+            progress_data = get_whisperx_progress_info()
+    
     return jsonify(progress_data)
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0') 
+    app.run(debug=True, host='0.0.0.0', port=5001) 
